@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# Drive a headful Chromium on a Raspberry Pi from this Mac.
+set -euo pipefail
+
+HOST="${PIBROWSER_HOST:-rpi}"
+PORT="${PIBROWSER_PORT:-9333}"
+MCP_PKG="@playwright/mcp@0.0.83"
+ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
+
+# Runs on the Pi. It travels on stdin so that no process pattern appears in the
+# argv of the remote shell, where pgrep/pkill -f would match (and kill) it.
+read -r -d '' PI_SCRIPT <<'PI' || true
+set -u
+export XDG_RUNTIME_DIR="/run/user/$(id -u)" WAYLAND_DISPLAY=wayland-0
+DIR="$HOME/.pibrowser"
+
+browser_pid() {
+  for p in $(pgrep -f "user-data-dir=$DIR/profile"); do
+    case "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)" in
+      *--type=*|'') ;;
+      *) echo "$p"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+cdp_version() { curl -fsS --max-time 2 http://127.0.0.1:9222/json/version 2>/dev/null; }
+
+case "$1" in
+  start)
+    if pid=$(browser_pid); then
+      echo "chromium: already running (pid $pid)"
+    else
+      mkdir -p "$DIR"
+      setsid nohup /usr/bin/chromium --ozone-platform=wayland \
+        --user-data-dir="$DIR/profile" --remote-debugging-port=9222 \
+        --no-first-run --no-default-browser-check \
+        --disable-features=Translate,MediaRouter --renderer-process-limit=2 \
+        --disk-cache-size=52428800 --hide-crash-restore-bubble --start-maximized \
+        >>"$DIR/chromium.log" 2>&1 </dev/null &
+      echo "chromium: launched"
+    fi
+    i=0
+    until cdp_version >/dev/null; do
+      i=$((i + 1))
+      [ "$i" -gt 20 ] && { echo "chromium: CDP did not answer in 20 s, see $DIR/chromium.log" >&2; exit 1; }
+      sleep 1
+    done
+    ;;
+  stop)
+    pid=$(browser_pid) || { echo "chromium: not running"; exit 0; }
+    kill -TERM "$pid"
+    i=0
+    while kill -0 "$pid" 2>/dev/null; do
+      i=$((i + 1))
+      if [ "$i" -gt 10 ]; then
+        echo "chromium: no exit after SIGTERM in 10 s, sending SIGKILL"
+        kill -KILL "$pid"
+        break
+      fi
+      sleep 1
+    done
+    echo "chromium: stopped"
+    ;;
+  status)
+    if pid=$(browser_pid); then echo "chromium:   running (pid $pid)"; else echo "chromium:   not running"; fi
+    v=$(cdp_version | sed -n 's/.*"Browser": *"\([^"]*\)".*/\1/p')
+    echo "cdp:        ${v:-no answer on 127.0.0.1:9222}"
+    awk '/^MemAvailable/ {a=$2} /^SwapTotal/ {t=$2} /^SwapFree/ {f=$2}
+         END {printf "memory:     %d MB available, swap %d MB used\n", a/1024, (t-f)/1024}' /proc/meminfo
+    echo "temp:       $(vcgencmd measure_temp | cut -d= -f2)"
+    t=$(vcgencmd get_throttled | cut -d= -f2)
+    words=""
+    [ $((t & 0x1)) -ne 0 ] && words="$words, under-voltage now"
+    [ $((t & 0x4)) -ne 0 ] && words="$words, throttled now"
+    [ $((t & 0x10000)) -ne 0 ] && words="$words, under-voltage since boot"
+    [ $((t & 0x40000)) -ne 0 ] && words="$words, throttled since boot"
+    [ -z "$words" ] && words=", ok"
+    echo "power:      ${words#, } ($t)"
+    ;;
+  screenshot)
+    exec grim -
+    ;;
+esac
+PI
+
+pi() { ssh "$HOST" sh -s -- "$@" <<<"$PI_SCRIPT"; }
+
+tunnel_pid() { lsof -t -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true; }
+
+tunnel_up() {
+  local pid
+  pid=$(tunnel_pid)
+  if [[ -n "$pid" ]]; then
+    [[ "$(ps -p "$pid" -o comm=)" == *ssh ]] || { echo "tunnel: port $PORT is taken by pid $pid ($(ps -p "$pid" -o comm=))" >&2; exit 1; }
+    echo "tunnel: already open on 127.0.0.1:$PORT"
+  else
+    ssh -f -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -L "127.0.0.1:$PORT:127.0.0.1:9222" "$HOST"
+    echo "tunnel: opened 127.0.0.1:$PORT -> $HOST:9222"
+  fi
+}
+
+tunnel_down() {
+  local pid
+  pid=$(tunnel_pid)
+  if [[ -z "$pid" ]]; then echo "tunnel: not open"; return; fi
+  [[ "$(ps -p "$pid" -o comm=)" == *ssh ]] || { echo "tunnel: port $PORT belongs to a non-ssh process, left alone" >&2; return 1; }
+  kill "$pid"
+  echo "tunnel: closed"
+}
+
+lan_ip() { ssh -G "$HOST" 2>/dev/null | awk '$1 == "hostname" {print $2}'; }
+
+cmd_start() {
+  pi start
+  tunnel_up
+  curl -fsS --max-time 5 "http://127.0.0.1:$PORT/json/version" >/dev/null \
+    || { echo "cdp: no answer on 127.0.0.1:$PORT" >&2; exit 1; }
+  echo "ready: http://127.0.0.1:$PORT"
+}
+
+cmd_stop() {
+  pi stop
+  tunnel_down
+}
+
+cmd_status() {
+  pi status
+  if [[ -n "$(tunnel_pid)" ]]; then echo "tunnel:     open on 127.0.0.1:$PORT"; else echo "tunnel:     closed"; fi
+}
+
+cmd_screenshot() {
+  local tmp="${TMPDIR:-/tmp}"
+  local out="${1:-${tmp%/}/pibrowser-$(date +%Y%m%d-%H%M%S).png}"
+  pi screenshot >"$out"
+  [[ -s "$out" ]] || { rm -f "$out"; echo "screenshot: grim returned nothing" >&2; exit 1; }
+  echo "$out"
+}
+
+cmd_view() {
+  local ip app
+  ip=$(lan_ip)
+  app=$(compgen -G "/Applications/*VNC*.app" | head -1 || true)
+  if [[ -z "$app" ]]; then
+    echo "No VNC viewer in /Applications. Install one: brew install --cask tigervnc" >&2
+    echo "Then connect to $ip::5900 (macOS Screen Sharing cannot connect to wayvnc)." >&2
+    exit 1
+  fi
+  # host::port, because TigerVNC reads host:N as display N (port 5900+N).
+  open -a "$app" --args "$ip::5900"
+  echo "view: opened $(basename "$app") at $ip::5900"
+}
+
+cmd_handoff() {
+  local msg="${1:?usage: pibrowser handoff \"<what the human must do>\"}"
+  osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "Pi browser needs you" sound name "Glass"' -e 'end run' "$msg"
+  cmd_view
+}
+
+cmd_install() {
+  local dir
+  dir="$(cd "${1:-$PWD}" && pwd)"
+  rm -rf "$dir/.claude/skills/pi-browser"
+  mkdir -p "$dir/.claude/skills"
+  cp -R "$ROOT/skill/pi-browser" "$dir/.claude/skills/pi-browser"
+  echo "skill: copied to $dir/.claude/skills/pi-browser"
+  (
+    cd "$dir"
+    claude mcp remove -s local pi-browser >/dev/null 2>&1 || true
+    claude mcp add -s local pi-browser -- npx -y "$MCP_PKG" --cdp-endpoint "http://127.0.0.1:$PORT"
+  )
+}
+
+cmd_help() {
+  cat <<EOF
+pibrowser: headful Chromium on the Pi ($HOST), CDP at 127.0.0.1:$PORT over an ssh tunnel.
+
+  start                 start Chromium on the Pi and open the tunnel
+  stop                  stop Chromium and close the tunnel
+  status                Chromium, tunnel, CDP version, memory, temperature, power
+  screenshot [out.png]  capture the whole Pi screen, print the file path
+  view                  open a VNC viewer (TigerVNC or RealVNC) on the Pi screen
+  handoff "<message>"   notify the human with the message, then view
+  install [dir]         copy the pi-browser skill into <dir> and register the MCP server
+  help                  this text
+
+Env: PIBROWSER_HOST (default rpi), PIBROWSER_PORT (default 9333).
+EOF
+}
+
+cmd="${1:-help}"
+shift || true
+case "$cmd" in
+  start | stop | status | screenshot | view | handoff | install | help) "cmd_$cmd" "$@" ;;
+  -h | --help) cmd_help ;;
+  *) cmd_help >&2; exit 2 ;;
+esac
