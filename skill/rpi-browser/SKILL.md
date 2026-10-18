@@ -1,6 +1,6 @@
 ---
 name: rpi-browser
-description: Drive the shared headful Chromium on the Raspberry Pi through the `mcp__rpi-browser__*` Playwright tools, see its screen, and hand control to the human for logins. Use when asked to verify, test, check, or run something "on the pi", "in the pi browser", "on the Pi's Chromium", or when a project skill says to use the Pi browser instead of Claude in Chrome.
+description: Drive the shared headful Chromium on the Raspberry Pi through the `mcp__rpi-browser__*` Playwright tools, see its screen, and hand control to the human through a local web viewer. Use when asked to verify, test, check, or run something "on the pi", "in the pi browser", "on the Pi's Chromium", or when a project skill says to use the Pi browser instead of Claude in Chrome.
 ---
 
 # rpi-browser
@@ -63,6 +63,9 @@ Snapshots that a tool writes to a file and screenshots without `filename` land i
 
 ## Seeing
 
+- The human watches the Pi screen live at `http://127.0.0.1:6080` (run `rpi-browser ui` to
+  start and open it). Tell the user this URL when they want to watch. The page is view-only
+  while you drive.
 - `rpi-browser screenshot` prints the path of a PNG of the whole Pi screen: browser
   chrome, permission prompts, native dialogs, and windows outside the page. Read
   the PNG to look at it. Use it when the page tools disagree with what you expect.
@@ -73,18 +76,26 @@ Snapshots that a tool writes to a file and screenshots without `filename` land i
 
 When the human must act (a login, 2FA, a captcha, a consent, or anything you must not do):
 
-1. Run `rpi-browser handoff "<what to do, in one line>"`. It sends a macOS notification
-   and opens a VNC viewer (TigerVNC) on the Pi screen. If it prints an install hint, pass the
-   hint and the address to the user.
+1. Run `rpi-browser handoff "<what to do, in one line>" --wait` as a background command.
+   It gives control to the human, shows the message in the web viewer with a Done
+   button, sends a macOS notification, and opens the viewer. The command exits and
+   prints the resolved handoff when the human clicks Done.
 2. Tell the user in chat exactly what to do and on which page, and that they should
-   reply when done.
-3. End the turn. Do not poll.
-4. After the user replies, take `browser_snapshot` (or `rpi-browser screenshot`) to
-   confirm the new state before you continue.
+   click Done in the viewer (or reply in chat) when finished.
+3. End the turn. Do not poll. You continue when the background command exits or the
+   user replies. If the user replies in chat first, run `rpi-browser release`.
+4. Take `browser_snapshot` (or `rpi-browser screenshot`) to confirm the new state before
+   you continue.
+
+Never act in the browser while control is `human`. The `ui:` line of `rpi-browser status`
+shows the state (`"control":"agent"` or `"control":"human"`). The human can also take
+control at any time with the Take over button.
 
 ## Trouble
 
-Run `rpi-browser status`. It shows whether Chromium and the tunnel are up, the CDP
-browser version, free memory, swap, temperature, and power warnings. If CDP does
-not answer, run `rpi-browser start` again. If memory is low, close extra tabs.
+Run `rpi-browser status`. It shows whether Chromium, the VNC server, the tunnel, and the
+web viewer are up, the CDP browser version, free memory, swap, temperature, power warnings,
+and the control state. If CDP does not answer, run `rpi-browser start` again. If memory is
+low, close extra tabs. If the viewer shows a grey screen, a client on the Pi's system VNC
+(port 5900) blocks capture: `status` warns about it, and the user must close that client.
 Chromium logs to `~/.rpi-browser/chromium.log` on the Pi (`ssh rpi tail ~/.rpi-browser/chromium.log`).
