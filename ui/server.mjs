@@ -95,6 +95,7 @@ async function route(req, res) {
     return sendFile(res, path);
   }
   if (key === 'GET /state') return send(res, 200, state);
+  if (key === 'GET /viewers') return send(res, 200, { count: sseClients.size });
   if (key === 'GET /events') {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
     res.write(`data: ${JSON.stringify(state)}\n\n`);

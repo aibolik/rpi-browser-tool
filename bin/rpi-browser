@@ -264,10 +264,19 @@ cmd_screenshot() {
   echo "$out"
 }
 
+# Each open page is one more VNC client on the Pi, so reuse a page that is already open.
+open_page() {
+  if [[ "$(curl -fsS --max-time 2 "$UI_URL/viewers" 2>/dev/null)" == '{"count":0}' ]]; then
+    open "$UI_URL"
+    echo "ui: opened $UI_URL"
+  else
+    echo "ui: a page is already open at $UI_URL"
+  fi
+}
+
 cmd_ui() {
   ensure_ui
-  open "$UI_URL"
-  echo "ui: opened $UI_URL"
+  open_page
 }
 
 cmd_view() {
@@ -299,14 +308,14 @@ cmd_handoff() {
   handoff=$(node -e 'process.stdout.write(JSON.stringify({ message: process.argv[1] }))' "$msg" \
     | curl -fsS -X POST -H 'content-type: application/json' --data-binary @- "$UI_URL/handoff")
   osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "Pi browser needs you" sound name "Glass"' -e 'end run' "$msg"
-  open "$UI_URL"
+  open_page >&2
   if [[ "$wait" == 0 ]]; then
     echo "$handoff"
     return
   fi
   echo "handoff: waiting for Done at $UI_URL" >&2
   id=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).id)' "$handoff")
-  curl -sS --fail-with-body "$UI_URL/handoff/$id/wait"
+  curl -sS --fail-with-body "$UI_URL/handoff/$id/wait" || { rc=$?; echo; exit "$rc"; }
   echo
 }
 
