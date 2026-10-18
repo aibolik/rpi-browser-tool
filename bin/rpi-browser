@@ -4,6 +4,9 @@ set -euo pipefail
 
 HOST="${RPI_BROWSER_HOST:-rpi}"
 PORT="${RPI_BROWSER_PORT:-9333}"
+VNC_PORT="${RPI_BROWSER_VNC_PORT:-5901}"
+UI_PORT="${RPI_BROWSER_UI_PORT:-6080}"
+UI_URL="http://127.0.0.1:$UI_PORT"
 MCP_PKG="@playwright/mcp@0.0.83"
 ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
 
@@ -26,7 +29,16 @@ browser_pid() {
 
 cdp_version() { curl -fsS --max-time 2 http://127.0.0.1:9222/json/version 2>/dev/null; }
 
-case "$1" in
+# A second wayvnc, loopback only and without auth, for noVNC and TigerVNC through
+# the ssh tunnel. The system wayvnc on :5900 offers no auth type noVNC supports.
+vnc_pid() { pgrep -u "$(id -u)" -f "wayvnc.*-S $DIR/wayvnc.sock"; }
+vnc_listening() { ss -Hltn 'sport = :5901' | grep -q .; }
+# Only one wayvnc can hold output power. While the system wayvnc has a client, this
+# wayvnc 0.9 never starts capture and its viewers see a blank grey screen.
+system_vnc_clients() { ss -Htn 'sport = :5900' | wc -l; }
+
+for cmd in "$@"; do
+case "$cmd" in
   start)
     if pid=$(browser_pid); then
       echo "chromium: already running (pid $pid)"
@@ -48,24 +60,65 @@ case "$1" in
     done
     ;;
   stop)
-    pid=$(browser_pid) || { echo "chromium: not running"; exit 0; }
-    kill -TERM "$pid"
+    if ! pid=$(browser_pid); then
+      echo "chromium: not running"
+    else
+      kill -TERM "$pid"
+      i=0
+      while kill -0 "$pid" 2>/dev/null; do
+        i=$((i + 1))
+        if [ "$i" -gt 10 ]; then
+          echo "chromium: no exit after SIGTERM in 10 s, sending SIGKILL"
+          kill -KILL "$pid"
+          break
+        fi
+        sleep 1
+      done
+      echo "chromium: stopped"
+    fi
+    ;;
+  vnc-start)
+    if pid=$(vnc_pid); then
+      echo "vnc: already running (pid $pid)"
+    else
+      mkdir -p "$DIR"
+      # An empty config means security type None; the ssh tunnel is the access control.
+      : >"$DIR/wayvnc.config"
+      rm -f "$DIR/wayvnc.sock"
+      setsid nohup wayvnc --render-cursor -C "$DIR/wayvnc.config" -S "$DIR/wayvnc.sock" 127.0.0.1 5901 \
+        >>"$DIR/wayvnc.log" 2>&1 </dev/null &
+      echo "vnc: launched on 127.0.0.1:5901"
+    fi
     i=0
-    while kill -0 "$pid" 2>/dev/null; do
+    until vnc_listening; do
       i=$((i + 1))
-      if [ "$i" -gt 10 ]; then
-        echo "chromium: no exit after SIGTERM in 10 s, sending SIGKILL"
-        kill -KILL "$pid"
-        break
-      fi
+      [ "$i" -gt 10 ] && { echo "vnc: wayvnc did not listen on 5901 in 10 s, see $DIR/wayvnc.log" >&2; exit 1; }
       sleep 1
     done
-    echo "chromium: stopped"
+    n=$(system_vnc_clients)
+    if [ "$n" -gt 0 ]; then echo "vnc: warning: $n client(s) on the system wayvnc :5900 block screen capture; close them" >&2; fi
+    ;;
+  vnc-stop)
+    if ! pid=$(vnc_pid); then
+      echo "vnc: not running"
+    else
+      wayvncctl -S "$DIR/wayvnc.sock" wayvnc-exit >/dev/null 2>&1 || kill -TERM "$pid"
+      i=0
+      while kill -0 "$pid" 2>/dev/null; do
+        i=$((i + 1))
+        [ "$i" -gt 5 ] && { kill -KILL "$pid"; break; }
+        sleep 1
+      done
+      echo "vnc: stopped"
+    fi
     ;;
   status)
     if pid=$(browser_pid); then echo "chromium:   running (pid $pid)"; else echo "chromium:   not running"; fi
     v=$(cdp_version | sed -n 's/.*"Browser": *"\([^"]*\)".*/\1/p')
     echo "cdp:        ${v:-no answer on 127.0.0.1:9222}"
+    if pid=$(vnc_pid); then echo "vnc:        running (pid $pid) on 127.0.0.1:5901"; else echo "vnc:        not running"; fi
+    n=$(system_vnc_clients)
+    if [ "$n" -gt 0 ]; then echo "vnc:        warning: $n client(s) on the system wayvnc :5900 block screen capture"; fi
     awk '/^MemAvailable/ {a=$2} /^SwapTotal/ {t=$2} /^SwapFree/ {f=$2}
          END {printf "memory:     %d MB available, swap %d MB used\n", a/1024, (t-f)/1024}' /proc/meminfo
     echo "temp:       $(vcgencmd measure_temp | cut -d= -f2)"
@@ -82,51 +135,125 @@ case "$1" in
     exec grim -
     ;;
 esac
+done
 PI
 
 pi() { ssh "$HOST" sh -s -- "$@" <<<"$PI_SCRIPT"; }
 
-tunnel_pid() { lsof -t -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true; }
+listener() { lsof -t -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | head -1 || true; }
+comm() { ps -p "$1" -o comm= 2>/dev/null || true; }
 
+# One ssh process carries both forwards. An older tunnel without the VNC forward is replaced.
 tunnel_up() {
-  local pid
-  pid=$(tunnel_pid)
-  if [[ -n "$pid" ]]; then
-    [[ "$(ps -p "$pid" -o comm=)" == *ssh ]] || { echo "tunnel: port $PORT is taken by pid $pid ($(ps -p "$pid" -o comm=))" >&2; exit 1; }
-    echo "tunnel: already open on 127.0.0.1:$PORT"
-  else
-    ssh -f -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -L "127.0.0.1:$PORT:127.0.0.1:9222" "$HOST"
-    echo "tunnel: opened 127.0.0.1:$PORT -> $HOST:9222"
+  local cdp vnc pid
+  cdp=$(listener "$PORT")
+  vnc=$(listener "$VNC_PORT")
+  if [[ -n "$cdp" && "$cdp" == "$vnc" && "$(comm "$cdp")" == *ssh ]]; then
+    echo "tunnel: already open on 127.0.0.1:$PORT and 127.0.0.1:$VNC_PORT"
+    return
   fi
+  for pid in $cdp $vnc; do
+    [[ "$(comm "$pid")" == *ssh ]] || { echo "tunnel: a local port is taken by pid $pid ($(comm "$pid"))" >&2; exit 1; }
+  done
+  if [[ -n "$cdp$vnc" ]]; then
+    kill $cdp $vnc 2>/dev/null || true
+    while [[ -n "$(listener "$PORT")$(listener "$VNC_PORT")" ]]; do sleep 0.2; done
+    echo "tunnel: replaced an incomplete tunnel"
+  fi
+  ssh -f -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+    -L "127.0.0.1:$PORT:127.0.0.1:9222" -L "127.0.0.1:$VNC_PORT:127.0.0.1:5901" "$HOST"
+  echo "tunnel: opened 127.0.0.1:$PORT -> $HOST:9222, 127.0.0.1:$VNC_PORT -> $HOST:5901"
 }
 
 tunnel_down() {
-  local pid
-  pid=$(tunnel_pid)
-  if [[ -z "$pid" ]]; then echo "tunnel: not open"; return; fi
-  [[ "$(ps -p "$pid" -o comm=)" == *ssh ]] || { echo "tunnel: port $PORT belongs to a non-ssh process, left alone" >&2; return 1; }
-  kill "$pid"
+  local pids pid
+  pids=$( (listener "$PORT"; listener "$VNC_PORT") | sort -u)
+  if [[ -z "$pids" ]]; then echo "tunnel: not open"; return; fi
+  for pid in $pids; do
+    if [[ "$(comm "$pid")" == *ssh ]]; then kill "$pid"; else echo "tunnel: pid $pid is not ssh, left alone" >&2; fi
+  done
   echo "tunnel: closed"
 }
 
-lan_ip() { ssh -G "$HOST" 2>/dev/null | awk '$1 == "hostname" {print $2}'; }
+ui_up() {
+  local pid
+  pid=$(listener "$UI_PORT")
+  if [[ -n "$pid" ]]; then
+    [[ "$(comm "$pid")" == *node ]] || { echo "ui: port $UI_PORT is taken by pid $pid ($(comm "$pid"))" >&2; exit 1; }
+    echo "ui: already running at $UI_URL"
+    return
+  fi
+  [[ -d "$ROOT/node_modules/ws" ]] || { echo "ui: run 'npm install' in $ROOT first" >&2; exit 1; }
+  local log="${TMPDIR:-/tmp}"
+  log="${log%/}/rpi-browser-ui.log"
+  RPI_BROWSER_UI_PORT="$UI_PORT" RPI_BROWSER_VNC_PORT="$VNC_PORT" \
+    nohup node "$ROOT/ui/server.mjs" >>"$log" 2>&1 </dev/null &
+  local i=0
+  until curl -fsS --max-time 1 "$UI_URL/state" >/dev/null 2>&1; do
+    i=$((i + 1))
+    [[ "$i" -gt 20 ]] && { echo "ui: server did not answer in 10 s, see $log" >&2; exit 1; }
+    sleep 0.5
+  done
+  echo "ui: started at $UI_URL (log $log)"
+}
+
+ui_down() {
+  local pid
+  pid=$(listener "$UI_PORT")
+  if [[ -z "$pid" ]]; then echo "ui: not running"; return; fi
+  [[ "$(comm "$pid")" == *node ]] || { echo "ui: port $UI_PORT belongs to a non-node process, left alone" >&2; return 1; }
+  kill "$pid"
+  echo "ui: stopped"
+}
+
+ui_post() {
+  curl -fsS -X POST "$UI_URL/$1" || { echo "ui: no answer at $UI_URL, run 'rpi-browser ui'" >&2; exit 1; }
+  echo
+}
+
+cdp_check() {
+  curl -fsS --max-time 5 "http://127.0.0.1:$PORT/json/version" >/dev/null \
+    || { echo "cdp: no answer on 127.0.0.1:$PORT" >&2; exit 1; }
+}
+
+# Chromium, the tunnel, the second wayvnc and the UI server, each started only when down.
+ensure_ui() {
+  pi start vnc-start
+  tunnel_up
+  cdp_check
+  ui_up
+}
 
 cmd_start() {
   pi start
   tunnel_up
-  curl -fsS --max-time 5 "http://127.0.0.1:$PORT/json/version" >/dev/null \
-    || { echo "cdp: no answer on 127.0.0.1:$PORT" >&2; exit 1; }
+  cdp_check
   echo "ready: http://127.0.0.1:$PORT"
 }
 
 cmd_stop() {
-  pi stop
+  ui_down
+  pi vnc-stop stop
   tunnel_down
 }
 
 cmd_status() {
+  local cdp vnc state
   pi status
-  if [[ -n "$(tunnel_pid)" ]]; then echo "tunnel:     open on 127.0.0.1:$PORT"; else echo "tunnel:     closed"; fi
+  cdp=$(listener "$PORT")
+  vnc=$(listener "$VNC_PORT")
+  if [[ -n "$cdp" && "$cdp" == "$vnc" ]]; then
+    echo "tunnel:     open on 127.0.0.1:$PORT (cdp) and 127.0.0.1:$VNC_PORT (vnc), pid $cdp"
+  elif [[ -n "$cdp$vnc" ]]; then
+    echo "tunnel:     incomplete (cdp pid ${cdp:-none}, vnc pid ${vnc:-none}), run 'rpi-browser start'"
+  else
+    echo "tunnel:     closed"
+  fi
+  if state=$(curl -fsS --max-time 2 "$UI_URL/state" 2>/dev/null); then
+    echo "ui:         $UI_URL $state"
+  else
+    echo "ui:         not running"
+  fi
 }
 
 cmd_screenshot() {
@@ -137,25 +264,54 @@ cmd_screenshot() {
   echo "$out"
 }
 
+cmd_ui() {
+  ensure_ui
+  open "$UI_URL"
+  echo "ui: opened $UI_URL"
+}
+
 cmd_view() {
-  local ip app
-  ip=$(lan_ip)
-  app=$(compgen -G "/Applications/*VNC*.app" | head -1 || true)
+  local app
+  app=$( (compgen -G "/Applications/TigerVNC*.app"; compgen -G "/Applications/*VNC*.app") | head -1 || true)
   if [[ -z "$app" ]]; then
     echo "No VNC viewer in /Applications. Install one: brew install --cask tigervnc" >&2
-    echo "Then connect to $ip::5900 (macOS Screen Sharing cannot connect to wayvnc)." >&2
+    echo "Or use the web viewer: rpi-browser ui" >&2
     exit 1
   fi
+  pi vnc-start
+  tunnel_up
   # host::port, because TigerVNC reads host:N as display N (port 5900+N).
-  open -a "$app" --args "$ip::5900"
-  echo "view: opened $(basename "$app") at $ip::5900"
+  local args=("127.0.0.1::$VNC_PORT")
+  if [[ "${1:-}" != "--control" ]]; then
+    if [[ "$app" == */TigerVNC* ]]; then args=(-ViewOnly "${args[@]}"); else echo "view: $(basename "$app") is not TigerVNC, view-only is not enforced" >&2; fi
+  fi
+  open -n -a "$app" --args "${args[@]}"
+  echo "view: opened $(basename "$app") ${args[*]}"
 }
 
 cmd_handoff() {
-  local msg="${1:?usage: rpi-browser handoff \"<what the human must do>\"}"
+  local msg="" wait=0 arg handoff id
+  for arg in "$@"; do
+    if [[ "$arg" == "--wait" ]]; then wait=1; else msg="$arg"; fi
+  done
+  [[ -n "$msg" ]] || { echo 'usage: rpi-browser handoff "<what the human must do>" [--wait]' >&2; exit 2; }
+  ensure_ui >&2
+  handoff=$(node -e 'process.stdout.write(JSON.stringify({ message: process.argv[1] }))' "$msg" \
+    | curl -fsS -X POST -H 'content-type: application/json' --data-binary @- "$UI_URL/handoff")
   osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "Pi browser needs you" sound name "Glass"' -e 'end run' "$msg"
-  cmd_view
+  open "$UI_URL"
+  if [[ "$wait" == 0 ]]; then
+    echo "$handoff"
+    return
+  fi
+  echo "handoff: waiting for Done at $UI_URL" >&2
+  id=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).id)' "$handoff")
+  curl -sS --fail-with-body "$UI_URL/handoff/$id/wait"
+  echo
 }
+
+cmd_take() { ui_post take; }
+cmd_release() { ui_post release; }
 
 cmd_install() {
   local dir
@@ -175,23 +331,29 @@ cmd_help() {
   cat <<EOF
 rpi-browser: headful Chromium on the Pi ($HOST), CDP at 127.0.0.1:$PORT over an ssh tunnel.
 
-  start                 start Chromium on the Pi and open the tunnel
-  stop                  stop Chromium and close the tunnel
-  status                Chromium, tunnel, CDP version, memory, temperature, power
-  screenshot [out.png]  capture the whole Pi screen, print the file path
-  view                  open a VNC viewer (TigerVNC or RealVNC) on the Pi screen
-  handoff "<message>"   notify the human with the message, then view
-  install [dir]         copy the rpi-browser skill into <dir> and register the MCP server
-  help                  this text
+  start                       start Chromium on the Pi and open the tunnel
+  stop                        stop the UI server, the Pi VNC server, Chromium, and the tunnel
+  status                      Chromium, CDP, VNC, memory, temperature, power, tunnel, UI state
+  screenshot [out.png]        capture the whole Pi screen, print the file path
+  ui                          start everything and open the web viewer at $UI_URL
+  handoff "<message>" [--wait]
+                              give control to the human with the message; --wait blocks
+                              until the human clicks Done and prints the resolved handoff
+  take                        give control to the human (the web viewer accepts input)
+  release                     give control back to the agent (the web viewer is view-only)
+  view [--control]            open TigerVNC on the Pi screen, view-only unless --control
+  install [dir]               copy the rpi-browser skill into <dir> and register the MCP server
+  help                        this text
 
-Env: RPI_BROWSER_HOST (default rpi), RPI_BROWSER_PORT (default 9333).
+Env: RPI_BROWSER_HOST (default rpi), RPI_BROWSER_PORT (CDP, default 9333),
+     RPI_BROWSER_VNC_PORT (default 5901), RPI_BROWSER_UI_PORT (default 6080).
 EOF
 }
 
 cmd="${1:-help}"
 shift || true
 case "$cmd" in
-  start | stop | status | screenshot | view | handoff | install | help) "cmd_$cmd" "$@" ;;
+  start | stop | status | screenshot | ui | handoff | take | release | view | install | help) "cmd_$cmd" "$@" ;;
   -h | --help) cmd_help ;;
   *) cmd_help >&2; exit 2 ;;
 esac
