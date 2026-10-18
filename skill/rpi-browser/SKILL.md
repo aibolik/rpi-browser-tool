@@ -1,29 +1,29 @@
 ---
-name: pi-browser
-description: Drive the shared headful Chromium on the Raspberry Pi through the `mcp__pi-browser__*` Playwright tools, see its screen, and hand control to the human for logins. Use when asked to verify, test, check, or run something "on the pi", "in the pi browser", "on the Pi's Chromium", or when a project skill says to use the Pi browser instead of Claude in Chrome.
+name: rpi-browser
+description: Drive the shared headful Chromium on the Raspberry Pi through the `mcp__rpi-browser__*` Playwright tools, see its screen, and hand control to the human for logins. Use when asked to verify, test, check, or run something "on the pi", "in the pi browser", "on the Pi's Chromium", or when a project skill says to use the Pi browser instead of Claude in Chrome.
 ---
 
-# pi-browser
+# rpi-browser
 
 A headful Chromium runs on the Raspberry Pi (1 GB RAM) with one persistent profile.
 Its CDP port reaches this Mac through an ssh tunnel at `127.0.0.1:9333`. The
-`pi-browser` MCP server (Playwright MCP) attaches to that browser. The `pibrowser`
+`rpi-browser` MCP server (Playwright MCP) attaches to that browser. The `rpi-browser`
 command on the Mac starts it, shows it, and hands it to the human.
 
 ## Start
 
-1. Run `pibrowser start` before the first browser tool call. It is idempotent: it
+1. Run `rpi-browser start` before the first browser tool call. It is idempotent: it
    starts Chromium and the tunnel only when they are not up, and ends with `ready:`.
 2. Load the tools in one ToolSearch call:
-   `select:mcp__pi-browser__browser_tabs,mcp__pi-browser__browser_navigate,mcp__pi-browser__browser_evaluate,mcp__pi-browser__browser_snapshot,mcp__pi-browser__browser_find,mcp__pi-browser__browser_click,mcp__pi-browser__browser_type,mcp__pi-browser__browser_press_key,mcp__pi-browser__browser_take_screenshot,mcp__pi-browser__browser_console_messages,mcp__pi-browser__browser_network_requests,mcp__pi-browser__browser_network_request,mcp__pi-browser__browser_wait_for`.
+   `select:mcp__rpi-browser__browser_tabs,mcp__rpi-browser__browser_navigate,mcp__rpi-browser__browser_evaluate,mcp__rpi-browser__browser_snapshot,mcp__rpi-browser__browser_find,mcp__rpi-browser__browser_click,mcp__rpi-browser__browser_type,mcp__rpi-browser__browser_press_key,mcp__rpi-browser__browser_take_screenshot,mcp__rpi-browser__browser_console_messages,mcp__rpi-browser__browser_network_requests,mcp__rpi-browser__browser_network_request,mcp__rpi-browser__browser_wait_for`.
    Add `browser_fill_form`, `browser_select_option`, `browser_hover`,
    `browser_handle_dialog` or `browser_file_upload` to the same call when the task needs them.
-3. If the tools do not appear, the project has no `pi-browser` MCP server. Tell the
-   user to run `pibrowser install` in the project and restart Claude Code.
+3. If the tools do not appear, the project has no `rpi-browser` MCP server. Tell the
+   user to run `rpi-browser install` in the project and restart Claude Code.
 
 ## Claude in Chrome to Playwright MCP
 
-All names below carry the `mcp__pi-browser__` prefix.
+All names below carry the `mcp__rpi-browser__` prefix.
 
 | Claude in Chrome | Pi browser | Notes |
 | --- | --- | --- |
@@ -56,14 +56,14 @@ Snapshots that a tool writes to a file and screenshots without `filename` land i
 - Work in a new tab (`browser_tabs` `new`) and close that tab at the end. Keep one
   tab of your own at a time: the Pi has 1 GB of RAM.
 - Never close the browser itself. Do not call `browser_close`: it only drops the MCP
-  connection and leaves the tab open. Do not run `pibrowser stop` unless the user asks.
+  connection and leaves the tab open. Do not run `rpi-browser stop` unless the user asks.
 - Never type a password, a one-time code, or other secrets. Hand that step to the human.
 - Do not trigger `alert`/`confirm`/`prompt` on purpose. If one is open, use
   `browser_handle_dialog`.
 
 ## Seeing
 
-- `pibrowser screenshot` prints the path of a PNG of the whole Pi screen: browser
+- `rpi-browser screenshot` prints the path of a PNG of the whole Pi screen: browser
   chrome, permission prompts, native dialogs, and windows outside the page. Read
   the PNG to look at it. Use it when the page tools disagree with what you expect.
 - `browser_take_screenshot` captures the page viewport only. Use it for evidence.
@@ -73,18 +73,18 @@ Snapshots that a tool writes to a file and screenshots without `filename` land i
 
 When the human must act (a login, 2FA, a captcha, a consent, or anything you must not do):
 
-1. Run `pibrowser handoff "<what to do, in one line>"`. It sends a macOS notification
+1. Run `rpi-browser handoff "<what to do, in one line>"`. It sends a macOS notification
    and opens a VNC viewer (TigerVNC) on the Pi screen. If it prints an install hint, pass the
    hint and the address to the user.
 2. Tell the user in chat exactly what to do and on which page, and that they should
    reply when done.
 3. End the turn. Do not poll.
-4. After the user replies, take `browser_snapshot` (or `pibrowser screenshot`) to
+4. After the user replies, take `browser_snapshot` (or `rpi-browser screenshot`) to
    confirm the new state before you continue.
 
 ## Trouble
 
-Run `pibrowser status`. It shows whether Chromium and the tunnel are up, the CDP
+Run `rpi-browser status`. It shows whether Chromium and the tunnel are up, the CDP
 browser version, free memory, swap, temperature, and power warnings. If CDP does
-not answer, run `pibrowser start` again. If memory is low, close extra tabs.
-Chromium logs to `~/.pibrowser/chromium.log` on the Pi (`ssh rpi tail ~/.pibrowser/chromium.log`).
+not answer, run `rpi-browser start` again. If memory is low, close extra tabs.
+Chromium logs to `~/.rpi-browser/chromium.log` on the Pi (`ssh rpi tail ~/.rpi-browser/chromium.log`).

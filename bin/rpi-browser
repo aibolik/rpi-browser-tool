@@ -2,8 +2,8 @@
 # Drive a headful Chromium on a Raspberry Pi from this Mac.
 set -euo pipefail
 
-HOST="${PIBROWSER_HOST:-rpi}"
-PORT="${PIBROWSER_PORT:-9333}"
+HOST="${RPI_BROWSER_HOST:-rpi}"
+PORT="${RPI_BROWSER_PORT:-9333}"
 MCP_PKG="@playwright/mcp@0.0.83"
 ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
 
@@ -12,7 +12,7 @@ ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
 read -r -d '' PI_SCRIPT <<'PI' || true
 set -u
 export XDG_RUNTIME_DIR="/run/user/$(id -u)" WAYLAND_DISPLAY=wayland-0
-DIR="$HOME/.pibrowser"
+DIR="$HOME/.rpi-browser"
 
 browser_pid() {
   for p in $(pgrep -f "user-data-dir=$DIR/profile"); do
@@ -131,7 +131,7 @@ cmd_status() {
 
 cmd_screenshot() {
   local tmp="${TMPDIR:-/tmp}"
-  local out="${1:-${tmp%/}/pibrowser-$(date +%Y%m%d-%H%M%S).png}"
+  local out="${1:-${tmp%/}/rpi-browser-$(date +%Y%m%d-%H%M%S).png}"
   pi screenshot >"$out"
   [[ -s "$out" ]] || { rm -f "$out"; echo "screenshot: grim returned nothing" >&2; exit 1; }
   echo "$out"
@@ -152,7 +152,7 @@ cmd_view() {
 }
 
 cmd_handoff() {
-  local msg="${1:?usage: pibrowser handoff \"<what the human must do>\"}"
+  local msg="${1:?usage: rpi-browser handoff \"<what the human must do>\"}"
   osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "Pi browser needs you" sound name "Glass"' -e 'end run' "$msg"
   cmd_view
 }
@@ -160,20 +160,20 @@ cmd_handoff() {
 cmd_install() {
   local dir
   dir="$(cd "${1:-$PWD}" && pwd)"
-  rm -rf "$dir/.claude/skills/pi-browser"
+  rm -rf "$dir/.claude/skills/rpi-browser"
   mkdir -p "$dir/.claude/skills"
-  cp -R "$ROOT/skill/pi-browser" "$dir/.claude/skills/pi-browser"
-  echo "skill: copied to $dir/.claude/skills/pi-browser"
+  cp -R "$ROOT/skill/rpi-browser" "$dir/.claude/skills/rpi-browser"
+  echo "skill: copied to $dir/.claude/skills/rpi-browser"
   (
     cd "$dir"
-    claude mcp remove -s local pi-browser >/dev/null 2>&1 || true
-    claude mcp add -s local pi-browser -- npx -y "$MCP_PKG" --cdp-endpoint "http://127.0.0.1:$PORT"
+    claude mcp remove -s local rpi-browser >/dev/null 2>&1 || true
+    claude mcp add -s local rpi-browser -- npx -y "$MCP_PKG" --cdp-endpoint "http://127.0.0.1:$PORT"
   )
 }
 
 cmd_help() {
   cat <<EOF
-pibrowser: headful Chromium on the Pi ($HOST), CDP at 127.0.0.1:$PORT over an ssh tunnel.
+rpi-browser: headful Chromium on the Pi ($HOST), CDP at 127.0.0.1:$PORT over an ssh tunnel.
 
   start                 start Chromium on the Pi and open the tunnel
   stop                  stop Chromium and close the tunnel
@@ -181,10 +181,10 @@ pibrowser: headful Chromium on the Pi ($HOST), CDP at 127.0.0.1:$PORT over an ss
   screenshot [out.png]  capture the whole Pi screen, print the file path
   view                  open a VNC viewer (TigerVNC or RealVNC) on the Pi screen
   handoff "<message>"   notify the human with the message, then view
-  install [dir]         copy the pi-browser skill into <dir> and register the MCP server
+  install [dir]         copy the rpi-browser skill into <dir> and register the MCP server
   help                  this text
 
-Env: PIBROWSER_HOST (default rpi), PIBROWSER_PORT (default 9333).
+Env: RPI_BROWSER_HOST (default rpi), RPI_BROWSER_PORT (default 9333).
 EOF
 }
 
